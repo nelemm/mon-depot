@@ -1,0 +1,34 @@
+name: Surveillance CROUS
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {} # ajoute un bouton "Run workflow" pour tester manuellement
+
+permissions:
+  contents: write # nécessaire pour que le job commite seen.json
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python check_crous.py
+        env:
+          CROUS_SEARCH_URL: ${{ secrets.CROUS_SEARCH_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Sauvegarder l'état (seen.json)
+        run: |
+          git config user.name "crous-bot"
+          git config user.email "crous-bot@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "update seen.json [skip ci]"
+          git push
