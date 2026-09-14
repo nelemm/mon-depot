@@ -7,6 +7,9 @@ Le script :
    variable d'environnement CROUS_SEARCH_URL)
 2. compare les logements trouvés avec ceux déjà vus (stockés dans seen.json)
 3. poste un message dans Discord (via un webhook) pour chaque NOUVEAU logement
+4. envoie un récap "toujours actif" une fois par jour, et une alerte (au plus
+   une fois par jour aussi) si la page ne ressemble plus à une vraie page de
+   résultats CROUS
 
 Pensé pour tourner une fois toutes les 30 min via GitHub Actions (voir le
 fichier workflow fourni à côté). Pas de boucle interne : un run = une
@@ -43,14 +46,33 @@ HEADERS = {
     "Accept-Language": "fr-FR,fr;q=0.9",
 }
 
-# Page de surcharge officielle du CROUS ("vous êtes trop nombreux"). Si on ne
-# la détecte pas, le script croirait à tort qu'il y a 0 logement et pourrait
-# écraser l'état mémorisé pour rien.
+# Page de surcharge officielle du CROUS ("vous êtes trop nombreux").
 OVERLOAD_MARKER = "vous êtes trop nombreux"
+
+# Marqueurs de contenu qui prouvent qu'on a bien une vraie page de résultats
+# CROUS, que des logements soient trouvés ou non. Sans ce filet, un
+# changement de structure du site ferait tomber silencieusement le compte à
+# 0, indiscernable d'un vrai "0 logement".
+GENUINE_PAGE_MARKERS = (
+    "mon logement pour l'année",  # titre présent sur une page de résultats normale
+    "aucun logement trouvé",      # cas légitime de 0 résultat
+    "fr-card",                    # cas avec des résultats
+)
 
 
 class PageAnomalyError(Exception):
     """La page reçue ne ressemble pas à une vraie page de résultats CROUS."""
+
+
+def _sanity_check_page(html: str) -> None:
+    lower = html.lower()
+    if OVERLOAD_MARKER in lower:
+        raise PageAnomalyError("Page de surcharge CROUS ('vous êtes trop nombreux').")
+    if not any(marker in lower for marker in GENUINE_PAGE_MARKERS):
+        raise PageAnomalyError(
+            "Aucun marqueur de page CROUS reconnu — page probablement bloquée, "
+            "vide, ou site remanié."
+        )
 
 
 def fetch_listings() -> dict:
@@ -59,9 +81,7 @@ def fetch_listings() -> dict:
     r.raise_for_status()
     r.encoding = "utf-8"  # requests devine parfois mal l'encodage sur ce site
 
-    lower = r.text.lower()
-    if OVERLOAD_MARKER in lower:
-        raise PageAnomalyError("Page de surcharge CROUS ('vous êtes trop nombreux').")
+    _sanity_check_page(r.text)
 
     soup = BeautifulSoup(r.text, "html.parser")
     listings = {}
@@ -101,15 +121,16 @@ def fetch_listings() -> dict:
 
 
 def notify_discord(item: dict) -> None:
+    description = " · ".join(
+        p for p in (item["price"], item["addr"], item["details"]) if p
+    )
     embed = {
         "title": item["title"][:250],
         "url": item["link"],
-        "description": " · ".join(
-            p for p in (item["price"], item["addr"], item["details"]) if p
-        )
-        or None,
         "color": 0x2ECC71,
     }
+    if description:
+        embed["description"] = description  # omis si vide, jamais envoyé à null
     payload = {"content": "🏠 Nouveau logement CROUS !", "embeds": [embed]}
     try:
         resp = requests.post(WEBHOOK_URL, json=payload, timeout=20)
@@ -141,17 +162,23 @@ def save_seen(keys) -> None:
     )
 
 
-def load_last_status_date() -> str | None:
+def load_status() -> dict:
+    """Petit état persistant : dates du dernier récap et de la dernière alerte
+    d'anomalie, pour ne notifier chacun qu'une fois par jour max."""
     if STATUS_FILE.exists():
         try:
-            return json.loads(STATUS_FILE.read_text(encoding="utf-8")).get("date")
+            return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
         except Exception:
-            return None
-    return None
+            pass
+    return {}
 
 
-def save_last_status_date(date_str: str) -> None:
-    STATUS_FILE.write_text(json.dumps({"date": date_str}), encoding="utf-8")
+def save_status(status: dict) -> None:
+    STATUS_FILE.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+
+
+def today_paris() -> str:
+    return datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
 
 
 def main() -> None:
@@ -164,19 +191,34 @@ def main() -> None:
 
     seen = load_seen()
     first_run = not SEEN_FILE.exists()
+    status = load_status()
+    today = today_paris()
 
     try:
         listings = fetch_listings()
     except PageAnomalyError as e:
         print(f"Anomalie de page, run ignoré : {e}")
+        # Au plus 1 alerte d'anomalie par jour, pour ne pas spammer si le
+        # problème persiste sur plusieurs runs consécutifs.
+        if status.get("anomaly_alert_date") != today:
+            notify_text(
+                f"⚠️ Le bot n'arrive pas à lire normalement le site CROUS ({e}). "
+                "Vérifie manuellement le site en attendant."
+            )
+            status["anomaly_alert_date"] = today
+            save_status(status)
         return
     except Exception as e:
         print(f"Échec de récupération : {e}")
         return
 
     if first_run:
-        # Premier lancement : on mémorise l'existant sans spammer Discord.
+        # Premier lancement : on mémorise l'existant sans spammer Discord, et
+        # on marque le récap du jour comme fait pour éviter un doublon
+        # quelques minutes plus tard le même jour.
         save_seen(listings.keys())
+        status["recap_date"] = today
+        save_status(status)
         notify_text(
             f"✅ Surveillance CROUS active — {len(listings)} logement(s) actuellement en ligne."
         )
@@ -191,13 +233,12 @@ def main() -> None:
     else:
         print(f"Rien de nouveau ({len(listings)} en ligne).")
 
-    # Un seul récap par jour (heure de Paris), pour ne pas spammer le salon
-    # toutes les 30 min. Les nouveaux logements, eux, continuent à notifier
-    # immédiatement via notify_discord ci-dessus, jour et nuit.
-    today = datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
-    if load_last_status_date() != today:
+    # Un seul récap par jour (heure de Paris). Les nouveaux logements, eux,
+    # continuent à notifier immédiatement via notify_discord ci-dessus.
+    if status.get("recap_date") != today:
         notify_text(f"🔎 Récap du jour — {len(listings)} logement(s) actuellement en ligne.")
-        save_last_status_date(today)
+        status["recap_date"] = today
+        save_status(status)
 
     save_seen(listings.keys())
 
