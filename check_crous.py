@@ -20,7 +20,9 @@ Variables d'environnement :
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,6 +30,7 @@ from bs4 import BeautifulSoup
 SEARCH_URL = os.environ.get("CROUS_SEARCH_URL", "").strip()
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 SEEN_FILE = Path("seen.json")
+STATUS_FILE = Path("last_status.json")
 BASE = "https://trouverunlogement.lescrous.fr"
 
 # Sans User-Agent réaliste, certains sites renvoient une page différente
@@ -138,6 +141,19 @@ def save_seen(keys) -> None:
     )
 
 
+def load_last_status_date() -> str | None:
+    if STATUS_FILE.exists():
+        try:
+            return json.loads(STATUS_FILE.read_text(encoding="utf-8")).get("date")
+        except Exception:
+            return None
+    return None
+
+
+def save_last_status_date(date_str: str) -> None:
+    STATUS_FILE.write_text(json.dumps({"date": date_str}), encoding="utf-8")
+
+
 def main() -> None:
     if not SEARCH_URL:
         print("ERREUR : CROUS_SEARCH_URL non défini.", file=sys.stderr)
@@ -174,6 +190,14 @@ def main() -> None:
             notify_discord(listings[k])
     else:
         print(f"Rien de nouveau ({len(listings)} en ligne).")
+
+    # Un seul récap par jour (heure de Paris), pour ne pas spammer le salon
+    # toutes les 30 min. Les nouveaux logements, eux, continuent à notifier
+    # immédiatement via notify_discord ci-dessus, jour et nuit.
+    today = datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
+    if load_last_status_date() != today:
+        notify_text(f"🔎 Récap du jour — {len(listings)} logement(s) actuellement en ligne.")
+        save_last_status_date(today)
 
     save_seen(listings.keys())
 
